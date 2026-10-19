@@ -6,13 +6,14 @@
 const DB_NAME = 'term-cards';
 const STORE = 'terms';
 const BACKUPS = 'backups';
+const IMAGES = 'images'; // 画像は用語と別に保存・同期する（用語側は画像IDの配列 images を持つ）
 const KEEP_BACKUPS = 7;
 let db;
 let terms = [];
 
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 2);
+    const req = indexedDB.open(DB_NAME, 3);
     req.onupgradeneeded = e => {
       const d = req.result;
       if (e.oldVersion < 1) {
@@ -21,6 +22,7 @@ function openDB() {
         s.createIndex('date', 'date');
       }
       if (e.oldVersion < 2) d.createObjectStore(BACKUPS, { keyPath: 'date' });
+      if (e.oldVersion < 3) d.createObjectStore(IMAGES, { keyPath: 'id' });
     };
     // 古いバージョンのアプリが別のタブ・ウィンドウで開いたままだと更新できない
     req.onblocked = () => {
@@ -51,11 +53,14 @@ const live = list => list.filter(t => !t.deleted);
 const nowISO = () => new Date().toISOString();
 
 // ローカルの変更を保存し、同期待ちにする
-async function saveLocal(list) {
+async function saveLocal(list, store = STORE) {
+  if (!list.length) return;
   list.forEach(r => (r.dirty = true));
-  await dbPutMany(list);
+  await idb('readwrite', s => list.forEach(o => s.put(o)), store);
   window.dispatchEvent(new Event('tc:local-change'));
 }
+const imgAll = () => idb('readonly', s => s.getAll(), IMAGES);
+const imgGet = id => idb('readonly', s => s.get(id), IMAGES);
 
 // ---------- ユーティリティ ----------
 const $ = sel => document.querySelector(sel);
@@ -92,7 +97,7 @@ function newTerm(f) {
 // ---------- 同期時の統合 ----------
 // 内容（用語・定義など）は editedAt が新しい方、暗記成績は lastReviewed が新しい方を採用する。
 // 片方の端末で定義を直し、もう片方で暗記しても、どちらも失われない。
-const CONTENT_KEYS = ['term', 'reading', 'definition', 'field', 'date', 'note', 'createdAt', 'deleted', 'deletedAt'];
+const CONTENT_KEYS = ['term', 'reading', 'definition', 'field', 'date', 'note', 'images', 'createdAt', 'deleted', 'deletedAt'];
 const STAT_KEYS = ['level', 'due', 'correct', 'wrong', 'lastReviewed'];
 function mergeRecord(local, remote) {
   if (!local) return { ...remote, dirty: false };
@@ -106,31 +111,45 @@ function mergeRecord(local, remote) {
   return out;
 }
 
-// sync.js から使う窓口
+// 画像は中身が変わらないので、追加・削除（editedAt）が新しい方を採用するだけ
+function mergeImage(local, remote) {
+  if (!local) return { ...remote, dirty: false };
+  const le = local.editedAt || '', re = remote.editedAt || '';
+  if (re > le) return { ...remote, dirty: false };
+  return { ...local, dirty: le > re };
+}
+
+// sync.js から使う窓口。kind は 'terms'（用語）か 'images'（画像）
+const KINDS = { terms: { store: STORE, merge: mergeRecord }, images: { store: IMAGES, merge: mergeImage } };
+const allOf = kind => idb('readonly', s => s.getAll(), KINDS[kind].store);
 window.TermApp = {
-  async getDirty() { return (await dbAll()).filter(t => t.dirty); },
-  async markAllDirty() { const all = await dbAll(); if (all.length) await saveLocal(all); },
-  async markClean(sent) {
-    const all = new Map((await dbAll()).map(t => [t.id, t]));
+  async getDirty(kind = 'terms') { return (await allOf(kind)).filter(t => t.dirty); },
+  async markAllDirty() {
+    for (const kind of Object.keys(KINDS)) await saveLocal(await allOf(kind), KINDS[kind].store);
+  },
+  async markClean(sent, kind = 'terms') {
+    const all = new Map((await allOf(kind)).map(t => [t.id, t]));
     const done = [];
     sent.forEach(s => {
       const cur = all.get(s.id);
       // 送信中に再び変更されていなければ「同期済み」にする
       if (cur && cur.editedAt === s.editedAt && cur.lastReviewed === s.lastReviewed) { cur.dirty = false; done.push(cur); }
     });
-    if (done.length) await dbPutMany(done);
+    if (done.length) await idb('readwrite', s => done.forEach(o => s.put(o)), KINDS[kind].store);
   },
-  async applyRemote(remoteList) {
+  async applyRemote(remoteList, kind = 'terms') {
     if (!remoteList.length) return;
-    const all = new Map((await dbAll()).map(t => [t.id, t]));
+    const { store, merge } = KINDS[kind];
+    const all = new Map((await allOf(kind)).map(t => [t.id, t]));
     const changed = [];
     remoteList.forEach(r => {
       const cur = all.get(r.id);
-      const m = mergeRecord(cur, r);
+      const m = merge(cur, r);
       if (!cur || JSON.stringify(m) !== JSON.stringify(cur)) changed.push(m);
     });
     if (!changed.length) return;
-    await dbPutMany(changed);
+    await idb('readwrite', s => changed.forEach(o => s.put(o)), store);
+    if (kind === 'images') changed.forEach(m => imgCache.delete(m.id));
     terms = live(await dbAll());
     refreshAll();
   },
@@ -147,6 +166,63 @@ function datesWithCount() {
   return [...m].sort((a, b) => (a[0] < b[0] ? 1 : -1));
 }
 
+// ---------- 画像 ----------
+const MAX_IMAGES = 6;
+const MAX_IMG_CHARS = 700000; // Firestore の1文書1MB制限に余裕をもって収まる大きさ
+const imgCache = new Map();
+async function imageData(id) {
+  if (imgCache.has(id)) return imgCache.get(id);
+  const r = await imgGet(id);
+  const d = r && !r.deleted ? r.data : null;
+  if (d) imgCache.set(id, d);
+  return d;
+}
+// 画面に描いた <img data-img> に中身を入れる（まだ同期されていない画像は「同期待ち」表示）
+function hydrate(root) {
+  root.querySelectorAll('img[data-img]').forEach(async img => {
+    if (img.getAttribute('src')) return;
+    const d = await imageData(img.dataset.img);
+    if (d) img.src = d; else img.classList.add('missing');
+  });
+}
+const thumbsHTML = (ids, cls = 'thumbs') =>
+  ids && ids.length ? `<div class="${cls}">${ids.map(id => `<img data-img="${esc(id)}" alt="画像（同期待ち）">`).join('')}</div>` : '';
+
+function loadImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('この画像は読み込めませんでした')); };
+    img.src = url;
+  });
+}
+// 長辺1280pxのJPEGに縮小。大きすぎるときは画質→サイズの順に下げる
+async function compressImage(file) {
+  const img = await loadImageFile(file);
+  let max = 1280, q = 0.82;
+  for (;;) {
+    const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * scale)), h = Math.max(1, Math.round(img.naturalHeight * scale));
+    const c = Object.assign(document.createElement('canvas'), { width: w, height: h });
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); // 透過PNGの背景が黒くならないように
+    ctx.drawImage(img, 0, 0, w, h);
+    const data = c.toDataURL('image/jpeg', q);
+    if (data.length <= MAX_IMG_CHARS || max <= 400) return { data, w, h };
+    if (q > 0.6) q -= 0.1; else max = Math.round(max * 0.8);
+  }
+}
+
+// 画像の拡大表示（カード上の画像はタップで裏返すので除く）
+document.addEventListener('click', e => {
+  const img = e.target.closest('img[data-img], .fimg img');
+  if (!img || !img.getAttribute('src') || img.closest('#card')) return;
+  $('#viewerImg').src = img.src;
+  $('#viewer').hidden = false;
+});
+$('#viewer').addEventListener('click', () => { $('#viewer').hidden = true; $('#viewerImg').removeAttribute('src'); });
+
 // ---------- タブ ----------
 function show(view) {
   document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
@@ -160,6 +236,43 @@ document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click
 
 // ---------- 登録 ----------
 const form = $('#termForm');
+let formImages = []; // 編集中の画像 { id, data, w, h, isNew }
+let formOrigImages = []; // 編集を始めた時点の画像ID
+function renderFormImages() {
+  $('#formImgs').innerHTML = formImages.map((im, i) => `<div class="fimg">${im.data
+    ? `<img src="${im.data}" alt="画像${i + 1}">` : '<span class="pending">同期待ち</span>'}
+    <button type="button" data-rm="${i}" aria-label="この画像を外す">×</button></div>`).join('');
+  $('#imgCount').textContent = formImages.length ? `${formImages.length} / ${MAX_IMAGES} 枚` : '';
+}
+async function addImageFiles(files) {
+  const list = [...files].filter(f => f.type.startsWith('image/'));
+  for (const f of list) {
+    if (formImages.length >= MAX_IMAGES) { toast(`画像は1語につき${MAX_IMAGES}枚までです`); break; }
+    try {
+      formImages.push({ id: uid(), ...(await compressImage(f)), isNew: true });
+      renderFormImages();
+    } catch (err) { toast(err.message); }
+  }
+}
+$('#f-img').addEventListener('change', e => { addImageFiles(e.target.files); e.target.value = ''; });
+$('#formImgs').addEventListener('click', e => {
+  const b = e.target.closest('[data-rm]'); if (!b) return;
+  formImages.splice(Number(b.dataset.rm), 1);
+  renderFormImages();
+});
+// 登録画面ではどこで貼り付けても（Ctrl+V）画像を追加できる
+document.addEventListener('paste', e => {
+  if (!$('#view-add').classList.contains('active')) return;
+  const files = [...(e.clipboardData?.files || [])].filter(f => f.type.startsWith('image/'));
+  if (!files.length) return;
+  e.preventDefault();
+  addImageFiles(files);
+});
+const drop = $('#imgDrop');
+['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(t => drop.addEventListener(t, () => drop.classList.remove('over')));
+drop.addEventListener('drop', e => { e.preventDefault(); addImageFiles(e.dataTransfer.files); });
+
 function resetForm(keepContext = true) {
   const field = $('#f-field').value, date = $('#f-date').value;
   form.reset();
@@ -169,6 +282,8 @@ function resetForm(keepContext = true) {
   $('#saveBtn').textContent = '登録してカード化';
   $('#cancelEdit').hidden = true;
   $('#dupWarn').hidden = true;
+  formImages = []; formOrigImages = [];
+  renderFormImages();
 }
 function localStorageGet(k) { try { return localStorage.getItem('tc:' + k); } catch { return null; } }
 function localStorageSet(k, v) { try { localStorage.setItem('tc:' + k, v); } catch { /* 無視 */ } }
@@ -218,6 +333,15 @@ form.addEventListener('submit', async e => {
     rec = newTerm(f);
     terms.push(rec);
   }
+  const now = nowISO();
+  const newImgs = formImages.filter(i => i.isNew).map(i => {
+    imgCache.set(i.id, i.data);
+    return { id: i.id, termId: rec.id, data: i.data, w: i.w, h: i.h, createdAt: now, editedAt: now, deleted: false };
+  });
+  const keep = new Set(formImages.map(i => i.id));
+  const removedImgs = (await Promise.all(formOrigImages.filter(id => !keep.has(id)).map(imgGet))).filter(Boolean).map(tombstone);
+  rec.images = formImages.map(i => i.id);
+  await saveLocal([...newImgs, ...removedImgs], IMAGES);
   await saveLocal([rec]);
   localStorageSet('lastField', rec.field);
   toast(id ? '更新しました' : `「${rec.term}」をカード化しました`);
@@ -228,9 +352,12 @@ form.addEventListener('submit', async e => {
 form.addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) form.requestSubmit(); });
 $('#cancelEdit').addEventListener('click', () => resetForm(false));
 
-function startEdit(id) {
+async function startEdit(id) {
   const t = terms.find(x => x.id === id); if (!t) return;
   show('add');
+  formOrigImages = [...(t.images || [])];
+  formImages = await Promise.all(formOrigImages.map(async i => ({ id: i, data: await imageData(i), isNew: false })));
+  renderFormImages();
   $('#f-id').value = t.id; $('#f-term').value = t.term; $('#f-reading').value = t.reading;
   $('#f-def').value = t.definition; $('#f-field').value = t.field; $('#f-date').value = t.date; $('#f-note').value = t.note;
   $('#saveBtn').textContent = '更新する'; $('#cancelEdit').hidden = false; $('#dupWarn').hidden = true;
@@ -243,9 +370,16 @@ function tombstone(t) {
   return { ...t, deleted: true, deletedAt: now, editedAt: now, updatedAt: now };
 }
 
+async function tombstoneImagesOf(list) {
+  const ids = list.flatMap(t => t.images || []);
+  const recs = (await Promise.all(ids.map(imgGet))).filter(r => r && !r.deleted);
+  await saveLocal(recs.map(tombstone), IMAGES);
+}
+
 async function removeTerm(id) {
   const t = terms.find(x => x.id === id); if (!t) return;
   if (!confirm(`「${t.term}」を削除しますか？`)) return;
+  await tombstoneImagesOf([t]);
   await saveLocal([tombstone(t)]);
   terms = terms.filter(x => x.id !== id);
   toast('削除しました');
@@ -255,9 +389,10 @@ async function removeTerm(id) {
 function itemHTML(t, open = false) {
   return `<li class="item"><details${open ? ' open' : ''}><summary>
     <span class="t">${esc(t.term)}</span>${t.reading ? `<span class="r">${esc(t.reading)}</span>` : ''}
-    <div class="labels"><span class="lab">${esc(t.field)}</span><span class="lab date">${esc(t.date)}</span><span class="lab lv">${LV_LABEL(t.level)}</span></div>
+    <div class="labels"><span class="lab">${esc(t.field)}</span><span class="lab date">${esc(t.date)}</span><span class="lab lv">${LV_LABEL(t.level)}</span>${t.images?.length ? `<span class="lab lv">画像${t.images.length}</span>` : ''}</div>
   </summary>
   <div class="d">${esc(t.definition)}</div>
+  ${thumbsHTML(t.images)}
   ${t.note ? `<div class="note">${esc(t.note)}</div>` : ''}
   <div class="acts"><button data-act="edit" data-id="${t.id}">編集</button><button data-act="del" data-id="${t.id}">削除</button></div>
   </details></li>`;
@@ -273,6 +408,7 @@ function renderRecent() {
   $('#recent').innerHTML = list.length
     ? `<h2>最近の登録</h2><ul class="list">${list.map(t => itemHTML(t)).join('')}</ul>`
     : '<p class="muted">まだ用語がありません。上のフォームから最初の用語を登録しましょう。</p>';
+  hydrate($('#recent'));
 }
 $('#recent').addEventListener('click', onListClick);
 
@@ -298,6 +434,7 @@ function renderDict() {
   list.sort(cmp);
   $('#dictCount').textContent = `${list.length} 件 / 全 ${terms.length} 件`;
   $('#dictList').innerHTML = list.map(t => itemHTML(t, !!q)).join('') || '<p class="muted">該当する用語がありません。</p>';
+  hydrate($('#dictList'));
 }
 ['#q', '#dictField', '#dictDate', '#dictSort'].forEach(s => $(s).addEventListener('input', renderDict));
 $('#dictList').addEventListener('click', onListClick);
@@ -321,8 +458,9 @@ function studyFilter() {
   const from = $('#dFrom').value, to = $('#dTo').value;
   const mode = document.querySelector('input[name=mode]:checked').value;
   const t0 = today();
+  const needImg = document.querySelector('input[name=dir]:checked').value === 'img';
   return terms.filter(t =>
-    selFields.has(t.field) && (!from || t.date >= from) && (!to || t.date <= to) &&
+    (!needImg || t.images?.length) && selFields.has(t.field) && (!from || t.date >= from) && (!to || t.date <= to) &&
     (mode === 'all' || (mode === 'due' && t.due <= t0) || (mode === 'weak' && t.level <= 1 && (t.wrong > 0 || t.lastReviewed))));
 }
 function updateStartBtn() {
@@ -346,7 +484,7 @@ $('#studyDates').addEventListener('click', e => {
 });
 $('#dClear').addEventListener('click', () => { $('#dFrom').value = ''; $('#dTo').value = ''; renderStudySetup(); });
 ['#dFrom', '#dTo'].forEach(s => $(s).addEventListener('change', renderStudySetup));
-document.querySelectorAll('input[name=mode]').forEach(r => r.addEventListener('change', updateStartBtn));
+document.querySelectorAll('input[name=mode], input[name=dir]').forEach(r => r.addEventListener('change', updateStartBtn));
 
 let session = null;
 function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
@@ -368,15 +506,23 @@ function nextCard() {
   if (!t) { session.queue.shift(); return nextCard(); }
   const card = $('#card');
   card.classList.remove('flipped');
+  card.classList.toggle('has-img', !!t.images?.length);
   $('#rateBtns').classList.remove('show');
   const meta = `<span class="lab">${esc(t.field)}</span><span class="lab date">${esc(t.date)}</span>`;
   $('#cMetaF').innerHTML = meta; $('#cMetaB').innerHTML = meta;
   const termHTML = `${esc(t.term)}${t.reading ? `<span class="sub">${esc(t.reading)}</span>` : ''}`;
   // 裏返しのアニメーション中に答えが見えないよう、少し遅らせて差し替える
+  const imgs = thumbsHTML(t.images, 'cimgs');
   const set = () => {
-    $('#cFront').innerHTML = session.dir === 'term' ? termHTML : esc(t.definition);
-    $('#cBack').innerHTML = session.dir === 'term' ? esc(t.definition) : termHTML;
+    const [front, back] = {
+      term: [termHTML, esc(t.definition) + imgs],
+      def: [esc(t.definition), termHTML + imgs],
+      img: [imgs, `${termHTML}<span class="defsmall">${esc(t.definition)}</span>`],
+    }[session.dir];
+    $('#cFront').innerHTML = front;
+    $('#cBack').innerHTML = back;
     $('#cNote').textContent = t.note || '';
+    hydrate($('#card'));
   };
   card.dataset.wasFlipped === '1' ? setTimeout(set, 180) : set();
   card.dataset.wasFlipped = '0';
@@ -452,8 +598,13 @@ function download(name, text, type) {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-$('#exportJson').addEventListener('click', () => {
-  download(`term-cards-${today()}.json`, JSON.stringify({ app: 'term-cards', version: 1, exportedAt: new Date().toISOString(), terms }, null, 2), 'application/json');
+async function imagesFor(list) {
+  const ids = list.flatMap(t => t.images || []);
+  return (await Promise.all(ids.map(imgGet))).filter(Boolean).map(({ dirty, deleted, deletedAt, ...r }) => r);
+}
+$('#exportJson').addEventListener('click', async () => {
+  const payload = { app: 'term-cards', version: 2, exportedAt: nowISO(), terms, images: await imagesFor(terms) };
+  download(`term-cards-${today()}.json`, JSON.stringify(payload, null, 2), 'application/json');
 });
 $('#exportCsv').addEventListener('click', () => {
   const cols = ['term', 'reading', 'definition', 'field', 'date', 'note', 'level', 'correct', 'wrong'];
@@ -474,6 +625,10 @@ $('#importJson').addEventListener('change', async e => {
       delete rec.dirty;
       return mergeRecord(byId.get(rec.id), rec); // 項目ごとに新しい方を残す
     });
+    if (Array.isArray(data.images)) {
+      const curImgs = new Map((await imgAll()).map(r => [r.id, r]));
+      await saveLocal(data.images.filter(r => r && r.id && r.data).map(r => mergeImage(curImgs.get(r.id), { deleted: false, ...r })), IMAGES);
+    }
     await saveLocal(incoming);
     terms = live(await dbAll());
     toast(`${incoming.length} 件を読み込みました`);
@@ -506,6 +661,7 @@ $('#wipe').addEventListener('click', async () => {
   if (!confirm(`全 ${terms.length} 件を削除します。同期中なら他の端末からも消えます。先にJSONで書き出しましたか？`)) return;
   if (prompt('確認のため「削除」と入力してください') !== '削除') return;
   await makeBackup(true);
+  await tombstoneImagesOf(terms);
   await saveLocal(terms.map(tombstone)); terms = []; toast('全データを削除しました（自動バックアップから復元できます）'); refreshAll();
 });
 
@@ -533,7 +689,8 @@ $('#backupList').addEventListener('click', async e => {
   const bk = await idb('readonly', s => s.get(b.dataset.bk), BACKUPS);
   if (!bk) return;
   if (b.dataset.act === 'dl') {
-    download(`term-cards-backup-${bk.date.slice(0, 10)}.json`, JSON.stringify({ app: 'term-cards', version: 1, terms: bk.terms }, null, 2), 'application/json');
+    const payload = { app: 'term-cards', version: 2, terms: bk.terms, images: await imagesFor(bk.terms) };
+    download(`term-cards-backup-${bk.date.slice(0, 10)}.json`, JSON.stringify(payload, null, 2), 'application/json');
     return;
   }
   if (!confirm(`${bk.date.slice(0, 10)} の状態（${bk.count}件）に戻します。それ以降の追加・変更は消えます（同期中なら他の端末にも反映）。よろしいですか？`)) return;
@@ -541,8 +698,15 @@ $('#backupList').addEventListener('click', async e => {
   const now = nowISO();
   const keep = new Set(bk.terms.map(t => t.id));
   const restored = bk.terms.map(t => ({ ...t, deleted: false, deletedAt: null, editedAt: now, lastReviewed: now, updatedAt: now }));
-  const removed = terms.filter(t => !keep.has(t.id)).map(tombstone);
-  await saveLocal([...restored, ...removed]);
+  const removedTerms = terms.filter(t => !keep.has(t.id));
+  await tombstoneImagesOf(removedTerms);
+  // 削除済みの画像も端末内には中身が残っているので、戻す用語の画像は復活させる
+  const imgIds = bk.terms.flatMap(t => t.images || []);
+  const revived = (await Promise.all(imgIds.map(imgGet))).filter(r => r && r.deleted)
+    .map(r => ({ ...r, deleted: false, deletedAt: null, editedAt: now }));
+  await saveLocal(revived, IMAGES);
+  revived.forEach(r => imgCache.delete(r.id));
+  await saveLocal([...restored, ...removedTerms.map(tombstone)]);
   terms = live(await dbAll());
   toast(`${restored.length} 件に戻しました`);
   refreshAll();

@@ -4,7 +4,9 @@
 import { firebaseConfig } from './firebase-config.js';
 
 const SDK = 'https://www.gstatic.com/firebasejs/12.3.0/';
-const BATCH_SIZE = 400; // Firestore の一括書き込み上限（500）より少なめ
+// 1回の一括書き込みの件数。用語は上限（500件）より少なめ、画像は1件最大0.7MBなので通信量の上限（10MB）に収まる数
+const BATCH_SIZE = { terms: 400, images: 8 };
+const KINDS = ['terms', 'images'];
 const $ = sel => document.querySelector(sel);
 const lsGet = k => { try { return localStorage.getItem('tc:' + k); } catch { return null; } };
 const lsSet = (k, v) => { try { localStorage.setItem('tc:' + k, v); } catch { /* 無視 */ } };
@@ -81,7 +83,7 @@ async function main() {
   state.error = '';
   render();
 
-  let unsubscribe = null, pushing = false, pushAgain = false, timer = null;
+  let unsubscribes = [], pushing = false, pushAgain = false, timer = null;
 
   async function push() {
     if (!state.user) return;
@@ -90,18 +92,23 @@ async function main() {
     try {
       do {
         pushAgain = false;
-        const dirty = await window.TermApp.getDirty();
-        state.pending = dirty.length; render();
-        for (let i = 0; i < dirty.length; i += BATCH_SIZE) {
-          const chunk = dirty.slice(i, i + BATCH_SIZE);
-          const batch = F.writeBatch(fs);
-          chunk.forEach(({ dirty: _, ...rec }) => {
-            // Firestore は undefined を保存できないので JSON を通して取り除く
-            batch.set(F.doc(fs, 'users', state.user.uid, 'terms', rec.id), JSON.parse(JSON.stringify(rec)));
-          });
-          await batch.commit(); // オフライン中はつながるまで待つ
-          await window.TermApp.markClean(chunk.map(t => ({ id: t.id, editedAt: t.editedAt, lastReviewed: t.lastReviewed })));
-          state.pending = Math.max(0, state.pending - chunk.length); render();
+        const dirty = {};
+        for (const kind of KINDS) dirty[kind] = await window.TermApp.getDirty(kind);
+        state.pending = KINDS.reduce((n, k) => n + dirty[k].length, 0); render();
+        // 画像を先に送る（用語が先に届くと、相手の端末で一瞬「同期待ち」になるため）
+        for (const kind of ['images', 'terms']) {
+          const list = dirty[kind], size = BATCH_SIZE[kind];
+          for (let i = 0; i < list.length; i += size) {
+            const chunk = list.slice(i, i + size);
+            const batch = F.writeBatch(fs);
+            chunk.forEach(({ dirty: _, ...rec }) => {
+              // Firestore は undefined を保存できないので JSON を通して取り除く
+              batch.set(F.doc(fs, 'users', state.user.uid, kind, rec.id), JSON.parse(JSON.stringify(rec)));
+            });
+            await batch.commit(); // オフライン中はつながるまで待つ
+            await window.TermApp.markClean(chunk.map(t => ({ id: t.id, editedAt: t.editedAt, lastReviewed: t.lastReviewed })), kind);
+            state.pending = Math.max(0, state.pending - chunk.length); render();
+          }
         }
       } while (pushAgain);
       state.pending = 0; state.error = ''; state.lastSync = new Date();
@@ -117,7 +124,7 @@ async function main() {
   const schedulePush = (ms = 1500) => { clearTimeout(timer); timer = setTimeout(push, ms); };
 
   A.onAuthStateChanged(auth, async user => {
-    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    unsubscribes.forEach(u => u()); unsubscribes = [];
     state.user = user; state.error = ''; state.lastSync = null; state.pending = 0;
     render();
     if (!user) return;
@@ -126,13 +133,12 @@ async function main() {
       await window.TermApp.markAllDirty();
       lsSet('syncedUid', user.uid);
     }
-    const col = F.collection(fs, 'users', user.uid, 'terms');
-    unsubscribe = F.onSnapshot(col, async snap => {
+    unsubscribes = KINDS.map(kind => F.onSnapshot(F.collection(fs, 'users', user.uid, kind), async snap => {
       // 自分が送った直後の変更（hasPendingWrites）は取り込み不要
       const changes = snap.docChanges()
         .filter(c => c.type !== 'removed' && !c.doc.metadata.hasPendingWrites)
         .map(c => c.doc.data());
-      await window.TermApp.applyRemote(changes);
+      await window.TermApp.applyRemote(changes, kind);
       if (!snap.metadata.fromCache) { state.lastSync = new Date(); if (!state.pending) state.error = ''; }
       render();
       schedulePush(300); // 取り込みの結果、こちらの方が新しい項目があれば送り返す
@@ -141,7 +147,7 @@ async function main() {
         ? '同期が拒否されました（Firestore のセキュリティルールでこのアカウントが許可されていません）。'
         : `同期に失敗しました（${err.code || err.message}）。`;
       render();
-    });
+    }));
     schedulePush(0);
   });
 

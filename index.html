@@ -33,6 +33,14 @@
       <label>意味・定義 <span class="req">*</span>
         <textarea id="f-def" required rows="4" placeholder="カードの裏面に出る説明"></textarea>
       </label>
+      <div class="imgfield">
+        <div class="glabel">画像 <span id="imgCount" class="muted"></span></div>
+        <div id="imgDrop" class="imgdrop">
+          <div id="formImgs" class="fimgs"></div>
+          <label class="filebtn imgbtn">画像を追加<input type="file" id="f-img" accept="image/*" multiple></label>
+          <span class="hint droptext">ここにドラッグ、または Ctrl+V で貼り付け</span>
+        </div>
+      </div>
       <label>分野 <span class="req">*</span>
         <input id="f-field" required list="fieldList" placeholder="例: 細胞生物学">
       </label>
@@ -101,6 +109,7 @@
         <div class="seg">
           <label><input type="radio" name="dir" value="term" checked>用語 → 意味</label>
           <label><input type="radio" name="dir" value="def">意味 → 用語</label>
+          <label><input type="radio" name="dir" value="img">画像 → 用語</label>
         </div>
       </div>
       <button id="startBtn" class="primary big">開始</button>
@@ -185,6 +194,7 @@
   <button data-view="data"><span>⚙</span>データ</button>
 </nav>
 
+<div id="viewer" class="viewer" hidden><img id="viewerImg" alt="拡大した画像"></div>
 <div id="toast" class="toast" hidden></div>
 <script src="app.js"></script>
 <script type="module" src="sync.js"></script>
