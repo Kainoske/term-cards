@@ -24,7 +24,8 @@
   python -m http.server 8790 --directory term-cards
   ```
   開いたら Chrome/Edge のアドレスバー右の「インストール」でアプリ化できます。
-- **スマホでも使う**：このフォルダを GitHub Pages などの HTTPS ホスティングに置き、スマホで開いて「ホーム画面に追加」。一度開けば以降はオフラインで動きます。
+- **スマホでも使う**：公開版 https://kainoske.github.io/term-cards/ をスマホで開いて「ホーム画面に追加」（iPhoneはSafariの共有ボタン→ホーム画面に追加、AndroidはChromeのメニュー→アプリをインストール）。一度開けば以降はオフラインで動きます。
 
 ## 更新時
-ファイルを変更したら `sw.js` の `VERSION` を上げると、インストール済みアプリのキャッシュも入れ替わります。
+ファイルを変更したら `sw.js` の `VERSION` を上げてから、このフォルダで commit して `git push` すると、1〜2分で公開版（GitHub Pages）に反映されます。
+
