@@ -15,7 +15,7 @@
 <body>
 <header class="topbar">
   <h1>研究用語カード</h1>
-  <span id="netStatus" class="net"></span>
+  <span class="net"><span id="syncBadge"></span> <span id="netStatus"></span></span>
 </header>
 
 <main>
@@ -138,13 +138,30 @@
     <h2>データ</h2>
     <p id="stats" class="muted"></p>
     <div class="group">
+      <div class="glabel">端末間の同期</div>
+      <p id="syncStatus"></p>
+      <div id="syncSignedOut" hidden>
+        <button id="googleLogin" class="primary">Googleでログインして同期</button>
+      </div>
+      <div id="syncSignedIn" hidden>
+        <p class="muted">ログイン中: <span id="syncUser"></span></p>
+        <div class="row"><button id="syncNow">今すぐ同期</button><button id="logout">ログアウト</button></div>
+      </div>
+      <p class="hint">PC・スマホで同じGoogleアカウントにログインすると、登録・編集・削除・暗記の記録が自動で同期されます。オフライン中の変更は、次にネットにつながったときに送られます。</p>
+    </div>
+    <div class="group">
+      <div class="glabel">自動バックアップ（この端末内・直近7回分）</div>
+      <ul id="backupList" class="backups"></ul>
+      <p class="hint">毎日最初の起動時と、全削除・復元の直前に自動で作られます。同期の不具合や誤操作で消えたときはここから戻せます。</p>
+    </div>
+    <div class="group">
       <div class="glabel">バックアップ</div>
       <div class="row">
         <button id="exportJson">JSONで書き出す</button>
         <button id="exportCsv">CSVで書き出す</button>
       </div>
       <label class="filebtn">JSONを読み込む（統合）<input type="file" id="importJson" accept=".json,application/json"></label>
-      <p class="hint">データはこの端末のブラウザ内（IndexedDB）にだけ保存されます。端末の移行や万一に備えて、ときどき書き出してください。</p>
+      <p class="hint">データは端末のブラウザ内（IndexedDB）に保存され、ログイン中はクラウドにも同期されます。万一に備えて、ときどき書き出しておくと安心です。</p>
     </div>
     <div class="group">
       <div class="glabel">まとめて登録（タブ区切り / Excelからコピペ可）</div>
@@ -170,5 +187,6 @@
 
 <div id="toast" class="toast" hidden></div>
 <script src="app.js"></script>
+<script type="module" src="sync.js"></script>
 </body>
 </html>

@@ -1,36 +1,50 @@
 'use strict';
 
 // ---------- 保存（IndexedDB） ----------
+// 削除は「削除済み」印（deleted）を付けて残し、同期で他の端末にも伝える。
+// 画面に出す terms は削除済みを除いたもの。
 const DB_NAME = 'term-cards';
 const STORE = 'terms';
+const BACKUPS = 'backups';
+const KEEP_BACKUPS = 7;
 let db;
 let terms = [];
 
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const s = req.result.createObjectStore(STORE, { keyPath: 'id' });
-      s.createIndex('field', 'field');
-      s.createIndex('date', 'date');
+    const req = indexedDB.open(DB_NAME, 2);
+    req.onupgradeneeded = e => {
+      const d = req.result;
+      if (e.oldVersion < 1) {
+        const s = d.createObjectStore(STORE, { keyPath: 'id' });
+        s.createIndex('field', 'field');
+        s.createIndex('date', 'date');
+      }
+      if (e.oldVersion < 2) d.createObjectStore(BACKUPS, { keyPath: 'date' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
-function idb(mode, fn) {
+function idb(mode, fn, store = STORE) {
   return new Promise((resolve, reject) => {
-    const t = db.transaction(STORE, mode);
-    const r = fn(t.objectStore(STORE));
+    const t = db.transaction(store, mode);
+    const r = fn(t.objectStore(store));
     t.oncomplete = () => resolve(r && r.result);
     t.onerror = () => reject(t.error);
   });
 }
 const dbAll = () => idb('readonly', s => s.getAll());
-const dbPut = o => idb('readwrite', s => s.put(o));
 const dbPutMany = list => idb('readwrite', s => list.forEach(o => s.put(o)));
-const dbDel = id => idb('readwrite', s => s.delete(id));
-const dbClear = () => idb('readwrite', s => s.clear());
+const live = list => list.filter(t => !t.deleted);
+const nowISO = () => new Date().toISOString();
+
+// ローカルの変更を保存し、同期待ちにする
+async function saveLocal(list) {
+  list.forEach(r => (r.dirty = true));
+  await dbPutMany(list);
+  window.dispatchEvent(new Event('tc:local-change'));
+}
 
 // ---------- ユーティリティ ----------
 const $ = sel => document.querySelector(sel);
@@ -56,13 +70,60 @@ const MAX_LV = INTERVALS.length - 1;
 const LV_LABEL = lv => (lv >= MAX_LV ? '習得' : `Lv${lv}`);
 
 function newTerm(f) {
-  const now = new Date().toISOString();
+  const now = nowISO();
   return {
     id: uid(), term: f.term.trim(), reading: (f.reading || '').trim(), definition: f.definition.trim(),
     field: (f.field || '未分類').trim(), date: f.date || today(), note: (f.note || '').trim(),
-    level: 0, due: today(), correct: 0, wrong: 0, lastReviewed: null, createdAt: now, updatedAt: now,
+    level: 0, due: today(), correct: 0, wrong: 0, lastReviewed: null, createdAt: now, updatedAt: now, editedAt: now,
   };
 }
+
+// ---------- 同期時の統合 ----------
+// 内容（用語・定義など）は editedAt が新しい方、暗記成績は lastReviewed が新しい方を採用する。
+// 片方の端末で定義を直し、もう片方で暗記しても、どちらも失われない。
+const CONTENT_KEYS = ['term', 'reading', 'definition', 'field', 'date', 'note', 'createdAt', 'deleted', 'deletedAt'];
+const STAT_KEYS = ['level', 'due', 'correct', 'wrong', 'lastReviewed'];
+function mergeRecord(local, remote) {
+  if (!local) return { ...remote, dirty: false };
+  const out = { ...local };
+  const le = local.editedAt || '', re = remote.editedAt || '';
+  const lr = local.lastReviewed || '', rr = remote.lastReviewed || '';
+  if (re > le) { CONTENT_KEYS.forEach(k => (out[k] = remote[k] ?? null)); out.editedAt = re; }
+  if (rr > lr) STAT_KEYS.forEach(k => (out[k] = remote[k] ?? null));
+  out.updatedAt = [out.editedAt, out.lastReviewed].filter(Boolean).sort().pop() || out.updatedAt;
+  out.dirty = le > re || lr > rr; // こちらの方が新しい部分があれば、まだ送る必要がある
+  return out;
+}
+
+// sync.js から使う窓口
+window.TermApp = {
+  async getDirty() { return (await dbAll()).filter(t => t.dirty); },
+  async markAllDirty() { const all = await dbAll(); if (all.length) await saveLocal(all); },
+  async markClean(sent) {
+    const all = new Map((await dbAll()).map(t => [t.id, t]));
+    const done = [];
+    sent.forEach(s => {
+      const cur = all.get(s.id);
+      // 送信中に再び変更されていなければ「同期済み」にする
+      if (cur && cur.editedAt === s.editedAt && cur.lastReviewed === s.lastReviewed) { cur.dirty = false; done.push(cur); }
+    });
+    if (done.length) await dbPutMany(done);
+  },
+  async applyRemote(remoteList) {
+    if (!remoteList.length) return;
+    const all = new Map((await dbAll()).map(t => [t.id, t]));
+    const changed = [];
+    remoteList.forEach(r => {
+      const cur = all.get(r.id);
+      const m = mergeRecord(cur, r);
+      if (!cur || JSON.stringify(m) !== JSON.stringify(cur)) changed.push(m);
+    });
+    if (!changed.length) return;
+    await dbPutMany(changed);
+    terms = live(await dbAll());
+    refreshAll();
+  },
+};
 
 function fieldsWithCount() {
   const m = new Map();
@@ -136,15 +197,17 @@ form.addEventListener('submit', async e => {
   let rec;
   if (id) {
     rec = terms.find(t => t.id === id);
+    if (!rec) { toast('この用語は他の端末で削除されました'); resetForm(false); return; }
+    const now = nowISO();
     Object.assign(rec, {
       term: f.term.trim(), reading: f.reading.trim(), definition: f.definition.trim(),
-      field: f.field.trim(), date: f.date || rec.date, note: f.note.trim(), updatedAt: new Date().toISOString(),
+      field: f.field.trim(), date: f.date || rec.date, note: f.note.trim(), updatedAt: now, editedAt: now,
     });
   } else {
     rec = newTerm(f);
     terms.push(rec);
   }
-  await dbPut(rec);
+  await saveLocal([rec]);
   localStorageSet('lastField', rec.field);
   toast(id ? '更新しました' : `「${rec.term}」をカード化しました`);
   resetForm(true);
@@ -164,10 +227,15 @@ function startEdit(id) {
   $('#f-term').focus();
 }
 
+function tombstone(t) {
+  const now = nowISO();
+  return { ...t, deleted: true, deletedAt: now, editedAt: now, updatedAt: now };
+}
+
 async function removeTerm(id) {
   const t = terms.find(x => x.id === id); if (!t) return;
   if (!confirm(`「${t.term}」を削除しますか？`)) return;
-  await dbDel(id);
+  await saveLocal([tombstone(t)]);
   terms = terms.filter(x => x.id !== id);
   toast('削除しました');
   refreshAll();
@@ -324,8 +392,9 @@ async function rate(r) {
     if (r === 'hard') { t.level = Math.max(1, t.level === 0 ? 1 : t.level); t.correct++; }
     if (r === 'again') { t.level = 0; t.wrong++; }
     t.due = addDays(today(), INTERVALS[t.level]);
-    t.lastReviewed = new Date().toISOString();
-    await dbPut(t);
+    t.lastReviewed = nowISO();
+    t.updatedAt = t.lastReviewed;
+    await saveLocal([t]);
     session.results[r]++;
     session.done++;
   }
@@ -387,15 +456,15 @@ $('#importJson').addEventListener('change', async e => {
     const data = JSON.parse(await file.text());
     const list = Array.isArray(data) ? data : data.terms;
     if (!Array.isArray(list)) throw new Error('形式が違います');
-    const byId = new Map(terms.map(t => [t.id, t]));
+    const byId = new Map((await dbAll()).map(t => [t.id, t]));
     const incoming = list.filter(x => x && x.term && x.definition).map(x => {
       const base = newTerm(x);
-      const rec = { ...base, ...x, id: x.id || base.id };
-      const cur = byId.get(rec.id);
-      return cur && cur.updatedAt > rec.updatedAt ? cur : rec; // 新しい方を残す
+      const rec = { ...base, ...x, id: x.id || base.id, editedAt: x.editedAt || x.updatedAt || base.editedAt };
+      delete rec.dirty;
+      return mergeRecord(byId.get(rec.id), rec); // 項目ごとに新しい方を残す
     });
-    await dbPutMany(incoming);
-    terms = await dbAll();
+    await saveLocal(incoming);
+    terms = live(await dbAll());
     toast(`${incoming.length} 件を読み込みました`);
     refreshAll();
   } catch (err) {
@@ -416,16 +485,56 @@ $('#bulkBtn').addEventListener('click', async () => {
       ? date.split('/').map((x, i) => (i ? pad(x) : x)).join('-') : today();
     added.push(newTerm({ term, definition, field: field || '未分類', date: d, reading, note }));
   });
-  if (added.length) { await dbPutMany(added); terms.push(...added); }
+  if (added.length) { await saveLocal(added); terms.push(...added); }
   $('#bulk').value = '';
   toast(`${added.length} 件登録${skipped.length ? `・${skipped.length} 件スキップ（重複/不足）` : ''}`);
   refreshAll();
 });
 $('#wipe').addEventListener('click', async () => {
   if (!terms.length) return;
-  if (!confirm(`全 ${terms.length} 件を削除します。元に戻せません。先にJSONで書き出しましたか？`)) return;
+  if (!confirm(`全 ${terms.length} 件を削除します。同期中なら他の端末からも消えます。先にJSONで書き出しましたか？`)) return;
   if (prompt('確認のため「削除」と入力してください') !== '削除') return;
-  await dbClear(); terms = []; toast('全データを削除しました'); refreshAll();
+  await makeBackup(true);
+  await saveLocal(terms.map(tombstone)); terms = []; toast('全データを削除しました（自動バックアップから復元できます）'); refreshAll();
+});
+
+// ---------- 自動バックアップ（この端末内に1日1つ・7日分） ----------
+// 同期の不具合や誤削除で全端末から消えても、ここから戻せるようにする。
+async function makeBackup(force = false) {
+  const key = force ? `${today()} ${new Date().toTimeString().slice(0, 8)}` : today(); // 端末の現地時刻
+  const list = await idb('readonly', s => s.getAll(), BACKUPS);
+  if (!force && list.some(b => b.date === key)) return;
+  const snapshot = live(await dbAll()).map(({ dirty, ...t }) => t);
+  if (!snapshot.length) return;
+  await idb('readwrite', s => s.put({ date: key, count: snapshot.length, terms: snapshot }), BACKUPS);
+  const old = list.map(b => b.date).sort().reverse().slice(KEEP_BACKUPS - 1);
+  if (old.length) await idb('readwrite', s => old.forEach(d => s.delete(d)), BACKUPS);
+}
+async function renderBackups() {
+  const list = (await idb('readonly', s => s.getAll(), BACKUPS)).sort((a, b) => (a.date < b.date ? 1 : -1));
+  $('#backupList').innerHTML = list.map(b => `<li><span>${esc(b.date.replace('T', ' ').slice(0, 16))}（${b.count}件）</span>
+    <button data-bk="${esc(b.date)}" data-act="restore">この時点に戻す</button>
+    <button data-bk="${esc(b.date)}" data-act="dl">保存</button></li>`).join('')
+    || '<li class="muted">まだありません（用語があれば毎日最初の起動時に作られます）</li>';
+}
+$('#backupList').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-bk]'); if (!b) return;
+  const bk = await idb('readonly', s => s.get(b.dataset.bk), BACKUPS);
+  if (!bk) return;
+  if (b.dataset.act === 'dl') {
+    download(`term-cards-backup-${bk.date.slice(0, 10)}.json`, JSON.stringify({ app: 'term-cards', version: 1, terms: bk.terms }, null, 2), 'application/json');
+    return;
+  }
+  if (!confirm(`${bk.date.slice(0, 10)} の状態（${bk.count}件）に戻します。それ以降の追加・変更は消えます（同期中なら他の端末にも反映）。よろしいですか？`)) return;
+  await makeBackup(true);
+  const now = nowISO();
+  const keep = new Set(bk.terms.map(t => t.id));
+  const restored = bk.terms.map(t => ({ ...t, deleted: false, deletedAt: null, editedAt: now, lastReviewed: now, updatedAt: now }));
+  const removed = terms.filter(t => !keep.has(t.id)).map(tombstone);
+  await saveLocal([...restored, ...removed]);
+  terms = live(await dbAll());
+  toast(`${restored.length} 件に戻しました`);
+  refreshAll();
 });
 
 async function renderData() {
@@ -440,6 +549,7 @@ async function renderData() {
       : '未許可：ブラウザの判断で消える可能性があります。アプリとしてインストールすると許可されやすくなります。';
   }
   $('#persistText').textContent = txt;
+  renderBackups();
 }
 
 function refreshAll() {
@@ -461,9 +571,13 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 }
 
 // ---------- 起動 ----------
-(async () => {
+window.TermApp.ready = (async () => {
   db = await openDB();
-  terms = await dbAll();
+  const all = await dbAll();
+  const needsMigration = all.filter(t => !t.editedAt); // 同期対応前のデータ
+  if (needsMigration.length) await dbPutMany(needsMigration.map(t => Object.assign(t, { editedAt: t.updatedAt || nowISO() })));
+  terms = live(all);
+  makeBackup().catch(err => console.warn('バックアップ失敗', err));
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   $('#f-date').value = today();
   $('#f-field').value = localStorageGet('lastField') || '';
