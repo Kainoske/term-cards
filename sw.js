@@ -1,5 +1,5 @@
 // オフライン用キャッシュ。アプリのファイルを更新したら VERSION を上げる。
-const VERSION = 'v3';
+const VERSION = 'v4';
 const CACHE = 'term-cards-' + VERSION;
 const ASSETS = [
   './', 'index.html', 'style.css', 'app.js', 'sync.js', 'firebase-config.js', 'manifest.webmanifest',

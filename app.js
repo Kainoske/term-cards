@@ -24,8 +24,9 @@ function openDB() {
     };
     // 古いバージョンのアプリが別のタブ・ウィンドウで開いたままだと更新できない
     req.onblocked = () => {
-      $('#netStatus').textContent = '';
-      alert('アプリを更新しています。このアプリを開いている他のタブやウィンドウを閉じてください。閉じると自動で続きます。');
+      window.TermApp.blocked = true;
+      window.dispatchEvent(new Event('tc:db-blocked'));
+      toast('更新待ち：このアプリを開いている他のタブ・ウィンドウを閉じてください');
     };
     req.onsuccess = () => {
       const d = req.result;

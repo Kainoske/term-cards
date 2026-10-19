@@ -40,14 +40,31 @@ async function main() {
   render();
   if (!firebaseConfig) return;
 
+  state.error = '準備中…（同期機能を読み込んでいます）';
+  render();
+  const showBlocked = () => {
+    state.error = '更新待ちです。このアプリを開いている他のタブ・ウィンドウ（インストールしたアプリを含む）をすべて閉じてください。閉じると自動で続きます。';
+    render();
+  };
+  if (window.TermApp.blocked) showBlocked();
+  window.addEventListener('tc:db-blocked', showBlocked);
+  const slow = setTimeout(() => {
+    if (!state.ready && !window.TermApp.blocked) {
+      state.error += ' — 時間がかかっています。このアプリの他のタブ・ウィンドウを閉じてから、このページを再読み込みしてください。';
+      render();
+    }
+  }, 10000);
+
   let mods;
   try {
     mods = await Promise.all(['firebase-app.js', 'firebase-auth.js', 'firebase-firestore.js'].map(f => import(SDK + f)));
   } catch {
+    clearTimeout(slow);
     state.error = '同期機能を読み込めませんでした（初回だけはネット接続が必要です）。';
     render();
     return;
   }
+  if (!window.TermApp.blocked) { state.error = '準備中…（端末内のデータを開いています）'; render(); }
   const [{ initializeApp }, A, F] = mods;
   const app = initializeApp(firebaseConfig);
   const auth = A.getAuth(app);
@@ -59,7 +76,9 @@ async function main() {
     fs = F.getFirestore(app);
   }
   await window.TermApp.ready;
+  clearTimeout(slow);
   state.ready = true;
+  state.error = '';
   render();
 
   let unsubscribe = null, pushing = false, pushAgain = false, timer = null;
