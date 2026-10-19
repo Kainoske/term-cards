@@ -22,7 +22,17 @@ function openDB() {
       }
       if (e.oldVersion < 2) d.createObjectStore(BACKUPS, { keyPath: 'date' });
     };
-    req.onsuccess = () => resolve(req.result);
+    // 古いバージョンのアプリが別のタブ・ウィンドウで開いたままだと更新できない
+    req.onblocked = () => {
+      $('#netStatus').textContent = '';
+      alert('アプリを更新しています。このアプリを開いている他のタブやウィンドウを閉じてください。閉じると自動で続きます。');
+    };
+    req.onsuccess = () => {
+      const d = req.result;
+      // 将来この端末で新しいバージョンが開かれたら、こちらは接続を閉じて読み込み直す
+      d.onversionchange = () => { d.close(); location.reload(); };
+      resolve(d);
+    };
     req.onerror = () => reject(req.error);
   });
 }
@@ -549,7 +559,7 @@ async function renderData() {
       : '未許可：ブラウザの判断で消える可能性があります。アプリとしてインストールすると許可されやすくなります。';
   }
   $('#persistText').textContent = txt;
-  renderBackups();
+  if (db) renderBackups();
 }
 
 function refreshAll() {
