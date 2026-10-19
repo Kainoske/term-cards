@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>研究用語カード</title>
+<meta name="description" content="研究で調べた専門用語の辞書と単語カード（オフライン対応）">
+<meta name="theme-color" content="#2f5d8a">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>研究用語カード</h1>
+  <span id="netStatus" class="net"></span>
+</header>
+
+<main>
+  <!-- 登録 -->
+  <section id="view-add" class="view active">
+    <form id="termForm" autocomplete="off">
+      <input type="hidden" id="f-id">
+      <label>用語 <span class="req">*</span>
+        <input id="f-term" required placeholder="例: 上皮間葉転換">
+      </label>
+      <div id="dupWarn" class="warn" hidden></div>
+      <label>読み・英語表記・略語
+        <input id="f-reading" placeholder="例: EMT / epithelial–mesenchymal transition">
+      </label>
+      <label>意味・定義 <span class="req">*</span>
+        <textarea id="f-def" required rows="4" placeholder="カードの裏面に出る説明"></textarea>
+      </label>
+      <label>分野 <span class="req">*</span>
+        <input id="f-field" required list="fieldList" placeholder="例: 細胞生物学">
+      </label>
+      <div id="fieldChips" class="chips"></div>
+      <datalist id="fieldList"></datalist>
+      <label>日付
+        <input id="f-date" type="date" required>
+      </label>
+      <label>出典・メモ
+        <textarea id="f-note" rows="2" placeholder="論文名・DOI・どこで出会ったか など"></textarea>
+      </label>
+      <div class="row">
+        <button type="submit" class="primary" id="saveBtn">登録してカード化</button>
+        <button type="button" id="cancelEdit" hidden>編集をやめる</button>
+      </div>
+      <p class="hint">Ctrl+Enter でも登録できます。分野と日付は次の登録にも引き継がれます。</p>
+    </form>
+    <div id="recent"></div>
+  </section>
+
+  <!-- 辞書 -->
+  <section id="view-dict" class="view">
+    <div class="filters">
+      <input id="q" type="search" placeholder="用語・読み・定義を検索">
+      <div class="row">
+        <select id="dictField"><option value="">すべての分野</option></select>
+        <select id="dictDate"><option value="">すべての日付</option></select>
+        <select id="dictSort">
+          <option value="new">新しい順</option>
+          <option value="old">古い順</option>
+          <option value="abc">五十音・ABC順</option>
+          <option value="weak">苦手順</option>
+        </select>
+      </div>
+    </div>
+    <p id="dictCount" class="muted"></p>
+    <ul id="dictList" class="list"></ul>
+  </section>
+
+  <!-- 暗記 -->
+  <section id="view-study" class="view">
+    <div id="studySetup">
+      <h2>出題範囲</h2>
+      <div class="group">
+        <div class="glabel">分野 <button type="button" class="link" id="fieldAll">全選択</button><button type="button" class="link" id="fieldNone">全解除</button></div>
+        <div id="studyFields" class="chips"></div>
+      </div>
+      <div class="group">
+        <div class="glabel">日付</div>
+        <div class="daterange">
+          <input id="dFrom" type="date" aria-label="開始日"><span>〜</span><input id="dTo" type="date" aria-label="終了日">
+        </div>
+        <button type="button" class="link" id="dClear">日付の指定をはずす</button>
+        <div id="studyDates" class="chips small"></div>
+      </div>
+      <div class="group">
+        <div class="glabel">出題するカード</div>
+        <div class="seg" id="modeSeg">
+          <label><input type="radio" name="mode" value="all" checked>すべて</label>
+          <label><input type="radio" name="mode" value="due">今日の復習</label>
+          <label><input type="radio" name="mode" value="weak">苦手のみ</label>
+        </div>
+      </div>
+      <div class="group">
+        <div class="glabel">表面</div>
+        <div class="seg">
+          <label><input type="radio" name="dir" value="term" checked>用語 → 意味</label>
+          <label><input type="radio" name="dir" value="def">意味 → 用語</label>
+        </div>
+      </div>
+      <button id="startBtn" class="primary big">開始</button>
+    </div>
+
+    <div id="studyRun" hidden>
+      <div class="progress"><div id="progBar"></div></div>
+      <p id="progText" class="muted center"></p>
+      <div id="card" class="card" tabindex="0" role="button" aria-label="タップして裏返す">
+        <div class="card-inner">
+          <div class="face front"><div class="meta" id="cMetaF"></div><div id="cFront" class="ctext"></div><div class="tap">タップで裏返す</div></div>
+          <div class="face back"><div class="meta" id="cMetaB"></div><div id="cBack" class="ctext"></div><div id="cNote" class="cnote"></div></div>
+        </div>
+      </div>
+      <div class="rate" id="rateBtns">
+        <button data-r="again" class="again">まだ <kbd>1</kbd></button>
+        <button data-r="hard" class="hard">あいまい <kbd>2</kbd></button>
+        <button data-r="good" class="good">覚えた <kbd>3</kbd></button>
+      </div>
+      <button id="quitBtn" class="link center-block">終了する</button>
+    </div>
+
+    <div id="studyDone" hidden class="center">
+      <h2>おつかれさまでした</h2>
+      <p id="doneText"></p>
+      <div class="row center-row">
+        <button id="retryWeak" class="primary">「まだ」だけもう一度</button>
+        <button id="backSetup">範囲を選び直す</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 設定 -->
+  <section id="view-data" class="view">
+    <h2>データ</h2>
+    <p id="stats" class="muted"></p>
+    <div class="group">
+      <div class="glabel">バックアップ</div>
+      <div class="row">
+        <button id="exportJson">JSONで書き出す</button>
+        <button id="exportCsv">CSVで書き出す</button>
+      </div>
+      <label class="filebtn">JSONを読み込む（統合）<input type="file" id="importJson" accept=".json,application/json"></label>
+      <p class="hint">データはこの端末のブラウザ内（IndexedDB）にだけ保存されます。端末の移行や万一に備えて、ときどき書き出してください。</p>
+    </div>
+    <div class="group">
+      <div class="glabel">まとめて登録（タブ区切り / Excelからコピペ可）</div>
+      <textarea id="bulk" rows="5" placeholder="用語&#9;意味&#9;分野&#9;日付(省略可)&#9;読み(省略可)&#9;メモ(省略可)"></textarea>
+      <button id="bulkBtn">まとめて登録</button>
+    </div>
+    <div class="group">
+      <div class="glabel">保存の永続化</div>
+      <p id="persistText" class="muted"></p>
+    </div>
+    <div class="group">
+      <button id="wipe" class="danger">全データを削除</button>
+    </div>
+  </section>
+</main>
+
+<nav class="tabs">
+  <button data-view="add" class="active"><span>＋</span>登録</button>
+  <button data-view="dict"><span>📖</span>辞書</button>
+  <button data-view="study"><span>🃏</span>暗記</button>
+  <button data-view="data"><span>⚙</span>データ</button>
+</nav>
+
+<div id="toast" class="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
